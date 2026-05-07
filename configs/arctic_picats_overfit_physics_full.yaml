@@ -1,0 +1,56 @@
+processed_dir: ./outputs/picats_arctic/sequences
+train_list: ./outputs/picats_arctic/splits/train.txt
+val_list: ./outputs/picats_arctic/splits/val.txt
+out_dir: ./outputs/picats_arctic/overfit_contact_positive_physics
+
+window: 16
+stride: 2
+batch_size: 2
+num_workers: 0
+
+epochs: 80
+lr: 0.0002
+min_lr: 1.0e-05
+weight_decay: 5.0e-05
+use_amp: false
+seed: 2026
+
+contact_thresh_m: 0.015
+dt: 0.0333333333
+stage: overfit_contact_positive_physics
+
+physics_scale_schedule:
+  type: linear
+  start: 0.0
+  end: 0.1
+  epochs: 60
+
+overfit:
+  enabled: true
+  require_positive_contact: true
+  num_windows: 8
+  min_contact_pos_count: 20
+  min_contact_ratio: 0.03
+  max_contact_ratio: 0.6
+
+loss_weights:
+  obj_trans: 1.0
+  obj_rot: 0.5
+  obj_arti: 0.5
+
+  contact_bce: 1.0
+  contact_focal: 0.5
+  contact_dice: 0.5
+  endpoint_contact_dist: 1.0
+
+  no_contact_static: 0.05
+  contact_velocity: 0.2
+  contact_motion_align: 0.05
+
+  impulse_dyn: 0.0
+  angular_dyn: 0.0
+  friction_cone: 0.0
+  non_contact_force: 0.0
+
+  delta_smooth: 0.05
+  force_smooth: 0.0
