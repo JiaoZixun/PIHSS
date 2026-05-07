@@ -63,7 +63,20 @@ def make_loader(cfg: Dict, split: str, overfit_batches: int = 0):
     )
     if overfit_batches > 0:
         n = min(len(ds), int(cfg['batch_size']) * overfit_batches)
-        ds = Subset(ds, list(range(n)))
+
+        scored = []
+        for i in range(len(ds)):
+            item = ds[i]
+            ratio = float(item["contact_label"].mean())
+            scored.append((ratio, i))
+
+        scored.sort(reverse=True)
+        keep = [i for _, i in scored[:n]]
+        print("[overfit] selected contact-rich windows:")
+        for r, i in scored[:n]:
+            print(f"  idx={i} contact_ratio={r:.4f}")
+
+        ds = Subset(ds, keep)
     return DataLoader(
         ds,
         batch_size=int(cfg['batch_size']),

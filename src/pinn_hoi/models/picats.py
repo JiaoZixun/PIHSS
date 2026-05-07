@@ -245,10 +245,14 @@ class ContactAwareObjectMotionTransformer(nn.Module):
             0.15 * torch.tanh(raw_delta[..., 1:4]),
             0.10 * torch.tanh(raw_delta[..., 4:7]),
         ], dim=-1)
-        pred_next = obj_pose[:, :-1].clone()
-        pred_next[..., 0:1] = pred_next[..., 0:1] + delta[..., 0:1]
-        pred_next[..., 1:4] = compose_axis_angle_delta(pred_next[..., 1:4], delta[..., 1:4])
-        pred_next[..., 4:7] = pred_next[..., 4:7] + delta[..., 4:7]
+        # Do NOT update slices of pred_next in-place. The rotation branch needs
+        # the base axis-angle tensor for autograd, and slice assignment changes
+        # the version counter of the underlying tensor, causing backward errors.
+        base_pose = obj_pose[:, :-1]
+        pred_arti = base_pose[..., 0:1] + delta[..., 0:1]
+        pred_rot = compose_axis_angle_delta(base_pose[..., 1:4], delta[..., 1:4])
+        pred_trans = base_pose[..., 4:7] + delta[..., 4:7]
+        pred_next = torch.cat([pred_arti, pred_rot, pred_trans], dim=-1)
 
         # Endpoint-conditioned outputs use temporal context added back to endpoint tokens.
         endpoint_ctx = Htok + temporal.unsqueeze(2)

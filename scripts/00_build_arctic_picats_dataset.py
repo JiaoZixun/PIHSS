@@ -26,7 +26,7 @@ def parse_args():
     p.add_argument('--split-out', required=True)
     p.add_argument('--num-object-points', type=int, default=2048)
     p.add_argument('--contact-thresh-m', type=float, default=0.015)
-    p.add_argument('--object-verts-scale', type=float, default=1.0)
+    p.add_argument('--object-verts-scale', type=float, default=0.001)
     p.add_argument('--device', default='cuda:0')
     p.add_argument('--max-seqs', type=int, default=-1)
     p.add_argument('--val-ratio', type=float, default=0.1)

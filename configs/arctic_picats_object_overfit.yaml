@@ -1,0 +1,49 @@
+processed_dir: ./outputs/picats_arctic/sequences
+train_list: ./outputs/picats_arctic/splits/train.txt
+val_list: ./outputs/picats_arctic/splits/val.txt
+out_dir: ./outputs/picats_arctic/exp_mini_contact_overfit
+window: 16
+stride: 2
+batch_size: 2
+num_workers: 0
+epochs: 60
+lr: 0.0002
+min_lr: 1.0e-05
+weight_decay: 5.0e-05
+grad_clip_norm: 1.0
+use_amp: false
+seed: 2026
+contact_thresh_m: 0.015
+dt: 0.0333333333
+model:
+  hidden_dim: 384
+  endpoint_token_dim: 128
+  object_token_dim: 128
+  num_object_tokens: 384
+  num_contact_blocks: 3
+  temporal_layers: 5
+  temporal_heads: 8
+  temporal_ffn_mult: 4
+  dropout: 0.1
+  use_contact_prior: true
+schedule:
+  supervised_warmup_epochs: 1000
+  physics_warmup_epochs: 0
+  max_physics_scale: 0.0
+loss_weights:
+  obj_trans: 100.0
+  obj_rot: 10.0
+  obj_arti: 10.0
+  contact_bce: 0.1
+  contact_focal: 0.0
+  contact_dice: 0.0
+  endpoint_contact_dist: 0.0
+  no_contact_static: 0.0
+  contact_velocity: 0.0
+  contact_motion_align: 0.0
+  impulse_dyn: 0.0
+  angular_dyn: 0.0
+  friction_cone: 0.0
+  non_contact_force: 0.0
+  delta_smooth: 0.0
+  force_smooth: 0.0
