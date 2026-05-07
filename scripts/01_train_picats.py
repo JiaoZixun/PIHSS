@@ -64,11 +64,13 @@ def select_overfit_indices(ds, cfg: Dict, fallback_batches: int = 0):
         valid_count = int(valid.sum().item())
         pos_count = int((gt * valid).sum().item())
         ratio = float(pos_count / max(valid_count, 1))
+        window_start = int(sample['window_start'].item())
+        window_end = int(sample['window_end'].item()) if 'window_end' in sample else window_start + int(cfg['window'])
         stats.append({
             'sample_idx': i,
             'sequence_path': sample['seq_path'],
-            'window_start': int(sample['window_start'].item()),
-            'window_end': int(sample['window_end'].item()),
+            'window_start': window_start,
+            'window_end': window_end,
             'contact_valid_count': valid_count,
             'gt_contact_pos_count': pos_count,
             'gt_contact_ratio': ratio,
