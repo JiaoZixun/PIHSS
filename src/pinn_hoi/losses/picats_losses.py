@@ -123,6 +123,7 @@ def compute_losses(
     out: Dict[str, torch.Tensor],
     cfg: Dict,
     physics_scale: float = 1.0,
+    full_physics_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     weights = cfg.get('loss_weights', {})
     dt = float(cfg.get('dt', 1.0 / 30.0))
@@ -149,16 +150,25 @@ def compute_losses(
     physics_keys = {
         'no_contact_static', 'contact_velocity', 'contact_motion_align', 'impulse_dyn',
         'angular_dyn', 'friction_cone', 'non_contact_force', 'force_smooth', 'delta_smooth',
-        'endpoint_contact_dist',
     }
-    total = torch.zeros((), device=pred_next.device, dtype=pred_next.dtype)
+    supervised_keys = {'obj_trans', 'obj_rot', 'obj_arti', 'contact_bce', 'contact_focal', 'contact_dice', 'endpoint_contact_dist'}
+    supervised_total = torch.zeros((), device=pred_next.device, dtype=pred_next.dtype)
+    physics_total = torch.zeros((), device=pred_next.device, dtype=pred_next.dtype)
     for k, v in losses.items():
         w = float(weights.get(k, 0.0))
+        if k in supervised_keys:
+            supervised_total = supervised_total + w * v
         if k in physics_keys:
-            w *= float(physics_scale)
-        total = total + w * v
+            physics_total = physics_total + w * v
+    total = supervised_total + float(physics_scale) * physics_total
+    total_full = supervised_total + float(full_physics_scale) * physics_total
+    losses['supervised_total'] = supervised_total
+    losses['physics_total'] = physics_total
+    losses['total_current_scale'] = total
+    losses['total_full_physics'] = total_full
     losses['total'] = total
     losses['physics_scale'] = torch.tensor(float(physics_scale), device=pred_next.device)
+    losses['physics_scale_full'] = torch.tensor(float(full_physics_scale), device=pred_next.device)
     return total, losses
 
 
@@ -184,9 +194,12 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
 
     vel_loss, align_loss = contact_velocity_loss(batch, out)
     contact_motion_cos = 1.0 - align_loss
+    quat_norm = torch.linalg.norm(pred_next[..., 1:4], dim=-1)
     return {
         'obj_trans_err_m': trans_err_m.mean(),
         'obj_rot_err_rad': rot_err.mean(),
+        'obj_rot_err_deg': rot_err.mean() * (180.0 / torch.pi),
+        'obj_rot_loss_raw': rot_err.mean(),
         'obj_arti_err': arti_err.mean(),
         'contact_precision': precision,
         'contact_recall': recall,
@@ -194,4 +207,6 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
         'no_contact_drift_m': no_contact_drift,
         'contact_velocity_residual_m': vel_loss,
         'contact_motion_cos': contact_motion_cos,
+        'quat_norm_mean': quat_norm.mean(),
+        'quat_norm_std': quat_norm.std(unbiased=False),
     }

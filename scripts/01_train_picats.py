@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os.path as osp
 from typing import Dict, Optional
 
@@ -17,16 +16,7 @@ sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..', 'src')))
 from pinn_hoi.data.arctic_io import ArcticPICATSWindowDataset
 from pinn_hoi.losses.picats_losses import compute_losses, compute_metrics
 from pinn_hoi.models.picats import build_model_from_config
-from pinn_hoi.utils.io import (
-    append_jsonl,
-    detach_to_float_dict,
-    ensure_dir,
-    load_config,
-    mean_float_dict,
-    save_json,
-    seed_everything,
-    to_device,
-)
+from pinn_hoi.utils.io import append_jsonl, ensure_dir, load_config, mean_float_dict, save_json, seed_everything, to_device
 
 
 def parse_args():
@@ -39,91 +29,88 @@ def parse_args():
 
 
 def physics_scale_for_epoch(epoch: int, cfg: Dict) -> float:
-    sch = cfg.get('schedule', {})
-    sup = int(sch.get('supervised_warmup_epochs', 0))
-    warm = int(sch.get('physics_warmup_epochs', 20))
-    max_scale = float(sch.get('max_physics_scale', 1.0))
-    if epoch < sup:
-        return 0.0
-    if warm <= 0:
-        return max_scale
-    x = min(max((epoch - sup + 1) / warm, 0.0), 1.0)
-    # smooth ramp is more stable than linear for PINN residuals
-    return max_scale * (0.5 - 0.5 * math.cos(math.pi * x))
+    sch = cfg.get('physics_scale_schedule', cfg.get('schedule', {}))
+    if sch.get('type', '') == 'linear':
+        epochs = max(1, int(sch.get('epochs', 1)))
+        start = float(sch.get('start', 0.0))
+        end = float(sch.get('end', 1.0))
+        alpha = min(max(epoch / max(epochs - 1, 1), 0.0), 1.0)
+        return start + alpha * (end - start)
+    return float(cfg.get('physics_scale', 1.0))
 
 
-def make_loader(cfg: Dict, split: str, overfit_batches: int = 0):
+def build_dataset(cfg: Dict, split: str):
     list_path = cfg['train_list'] if split == 'train' else cfg['val_list']
-    ds = ArcticPICATSWindowDataset(
-        list_path=list_path,
-        window=int(cfg['window']),
-        stride=int(cfg['stride']) if split == 'train' else int(cfg['window']),
-        contact_thresh_m=float(cfg.get('contact_thresh_m', 0.015)),
-        preload=False,
-    )
-    if overfit_batches > 0:
-        n = min(len(ds), int(cfg['batch_size']) * overfit_batches)
-
-        scored = []
-        for i in range(len(ds)):
-            item = ds[i]
-            ratio = float(item["contact_label"].mean())
-            scored.append((ratio, i))
-
-        scored.sort(reverse=True)
-        keep = [i for _, i in scored[:n]]
-        print("[overfit] selected contact-rich windows:")
-        for r, i in scored[:n]:
-            print(f"  idx={i} contact_ratio={r:.4f}")
-
-        ds = Subset(ds, keep)
-    return DataLoader(
-        ds,
-        batch_size=int(cfg['batch_size']),
-        shuffle=(split == 'train'),
-        num_workers=int(cfg.get('num_workers', 4)),
-        pin_memory=True,
-        drop_last=(split == 'train' and len(ds) >= int(cfg['batch_size'])),
-    )
+    return ArcticPICATSWindowDataset(list_path=list_path, window=int(cfg['window']), stride=int(cfg['stride']) if split == 'train' else int(cfg['window']), contact_thresh_m=float(cfg.get('contact_thresh_m', 0.015)), preload=False)
 
 
-def save_ckpt(path: str, model, optimizer, scaler, epoch: int, best_metric: float, cfg: Dict):
+def select_overfit_indices(ds, cfg: Dict, fallback_batches: int = 0):
+    over = cfg.get('overfit', {})
+    if not over.get('enabled', False) and fallback_batches <= 0:
+        return None
+    seed = int(over.get('fixed_indices_seed', cfg.get('seed', 2026)))
+    g = torch.Generator().manual_seed(seed)
+    n = int(over.get('num_windows', 0))
+    if n <= 0:
+        nb = int(over.get('num_batches', fallback_batches))
+        n = int(cfg['batch_size']) * max(nb, 1)
+    n = min(len(ds), n)
+    if bool(over.get('shuffle', False)):
+        idx = torch.randperm(len(ds), generator=g)[:n].tolist()
+    else:
+        idx = list(range(n))
+    return idx
+
+
+def make_loader_from_dataset(ds, cfg: Dict, split: str, subset_indices=None, shuffle=None):
+    if subset_indices is not None:
+        ds = Subset(ds, subset_indices)
+    if shuffle is None:
+        shuffle = (split == 'train')
+    return DataLoader(ds, batch_size=int(cfg['batch_size']), shuffle=shuffle, num_workers=int(cfg.get('num_workers', 4)), pin_memory=True, drop_last=(split == 'train' and len(ds) >= int(cfg['batch_size'])))
+
+
+def save_ckpt(path: str, model, optimizer, scaler, epoch: int, scores: Dict[str, float], cfg: Dict):
     ensure_dir(osp.dirname(path))
-    torch.save({
-        'model': model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'scaler': scaler.state_dict() if scaler is not None else None,
-        'epoch': epoch,
-        'best_metric': best_metric,
-        'config': cfg,
-    }, path)
+    torch.save({'model': model.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict() if scaler is not None else None, 'epoch': epoch, 'scores': scores, 'config': cfg}, path)
 
 
 def load_ckpt(path: str, model, optimizer=None, scaler=None):
     ckpt = torch.load(path, map_location='cpu')
     model.load_state_dict(ckpt['model'], strict=True)
-    if optimizer is not None and 'optimizer' in ckpt and ckpt['optimizer'] is not None:
+    if optimizer is not None and ckpt.get('optimizer') is not None:
         optimizer.load_state_dict(ckpt['optimizer'])
     if scaler is not None and ckpt.get('scaler') is not None:
         scaler.load_state_dict(ckpt['scaler'])
-    return int(ckpt.get('epoch', -1)) + 1, float(ckpt.get('best_metric', 1e9))
+    return int(ckpt.get('epoch', -1)) + 1
 
 
-def run_eval(model, loader, cfg, device):
+def run_eval(model, loader, cfg, device, split_tag: str, current_pscale: float):
     model.eval()
-    metrics_all = []
-    losses_all = []
+    metrics_all, losses_cur, losses_full = [], [], []
     with torch.no_grad():
-        for batch in tqdm(loader, desc='eval', leave=False):
+        for batch in tqdm(loader, desc=f'eval {split_tag}', leave=False):
             batch = to_device(batch, device)
             out = model(batch)
-            _, losses = compute_losses(batch, out, cfg, physics_scale=1.0)
-            metrics = compute_metrics(batch, out)
-            metrics_all.append(metrics)
-            losses_all.append(losses)
-    md = mean_float_dict(metrics_all)
-    ld = {f'val_loss/{k}': v for k, v in mean_float_dict(losses_all).items()}
-    md.update(ld)
+            _, lc = compute_losses(batch, out, cfg, physics_scale=current_pscale, full_physics_scale=1.0)
+            _, lf = compute_losses(batch, out, cfg, physics_scale=1.0, full_physics_scale=1.0)
+            metrics_all.append(compute_metrics(batch, out))
+            losses_cur.append(lc)
+            losses_full.append(lf)
+    md = {f'{split_tag}/{k}': v for k, v in mean_float_dict(metrics_all).items()}
+    lcur = mean_float_dict(losses_cur)
+    lfull = mean_float_dict(losses_full)
+    out = {
+        f'{split_tag}/total_current_scale': lcur['total_current_scale'],
+        f'{split_tag}/total_full_physics': lfull['total_current_scale'],
+        f'{split_tag}/supervised_total': lcur['supervised_total'],
+        f'{split_tag}/physics_total_full': lfull['physics_total'],
+        f'{split_tag}/physics_scale_current': lcur['physics_scale'],
+        f'{split_tag}/physics_scale_full': lfull['physics_scale'],
+    }
+    for k, v in lcur.items():
+        out[f'{split_tag}/loss_{k}'] = v
+    md.update(out)
     return md
 
 
@@ -137,67 +124,67 @@ def main():
     save_json(cfg, osp.join(out_dir, 'config.resolved.json'))
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_loader = make_loader(cfg, 'train', args.overfit_batches)
-    val_loader = make_loader(cfg, 'val', args.overfit_batches if args.overfit_batches > 0 else 0)
-    if len(train_loader) == 0:
-        raise RuntimeError('Empty training loader. Check train_list/window/stride.')
+    train_ds, val_ds = build_dataset(cfg, 'train'), build_dataset(cfg, 'val')
+    overfit_idx = select_overfit_indices(train_ds, cfg, args.overfit_batches)
+    overfit_same = bool(cfg.get('overfit', {}).get('same_val', False))
+    train_loader = make_loader_from_dataset(train_ds, cfg, 'train', overfit_idx, shuffle=bool(cfg.get('overfit', {}).get('shuffle', False) if overfit_idx is not None else True))
+    val_overfit_same_loader = make_loader_from_dataset(val_ds if not overfit_same else train_ds, cfg, 'val', overfit_idx if overfit_same else None, shuffle=False)
+    val_regular_loader = make_loader_from_dataset(val_ds, cfg, 'val', None, shuffle=False)
 
     model = build_model_from_config(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg['lr']), weight_decay=float(cfg.get('weight_decay', 0.0)))
     total_steps = max(1, int(cfg['epochs']) * len(train_loader))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps,
-        eta_min=float(cfg.get('min_lr', 1e-5)),
-    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=float(cfg.get('min_lr', 1e-5)))
     use_amp = bool(cfg.get('use_amp', True)) and device.type == 'cuda'
     scaler = GradScaler(enabled=use_amp)
-    start_epoch, best_metric = 0, 1e9
-    if args.resume:
-        start_epoch, best_metric = load_ckpt(args.resume, model, optimizer, scaler)
-        for _ in range(start_epoch * len(train_loader)):
-            scheduler.step()
+    start_epoch = load_ckpt(args.resume, model, optimizer, scaler) if args.resume else 0
 
+    best = {'object': 1e9, 'contact': -1e9, 'balanced': 1e9}
     metric_path = osp.join(out_dir, 'metrics.jsonl')
     for epoch in range(start_epoch, int(cfg['epochs'])):
         model.train()
         pscale = physics_scale_for_epoch(epoch, cfg)
         train_losses = []
-        pbar = tqdm(train_loader, desc=f'train epoch {epoch+1}/{cfg["epochs"]} p={pscale:.3f}')
+        pbar = tqdm(train_loader, desc=f'train {epoch+1}/{cfg["epochs"]} p={pscale:.3f}')
         for batch in pbar:
             batch = to_device(batch, device)
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=use_amp):
                 out = model(batch)
-                total, losses = compute_losses(batch, out, cfg, physics_scale=pscale)
+                total, losses = compute_losses(batch, out, cfg, physics_scale=pscale, full_physics_scale=1.0)
             scaler.scale(total).backward()
-            if float(cfg.get('grad_clip_norm', 0.0)) > 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg['grad_clip_norm']))
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
             train_losses.append(losses)
-            pbar.set_postfix({
-                'loss': float(total.detach().cpu()),
-                'trans': float(losses['obj_trans'].detach().cpu()),
-                'c_bce': float(losses['contact_bce'].detach().cpu()),
-            })
 
-        train_log = {f'train_loss/{k}': v for k, v in mean_float_dict(train_losses).items()}
-        val_log = run_eval(model, val_loader, cfg, device)
-        log = {'epoch': epoch + 1, 'lr': scheduler.get_last_lr()[0], 'physics_scale': pscale}
+        train_log = {f'train_overfit/{k}': v for k, v in mean_float_dict(train_losses).items()}
+        train_log['train_loss/total_current_scale'] = train_log['train_overfit/total_current_scale']
+        train_log['train_loss/physics_scale'] = train_log['train_overfit/physics_scale']
+        val_same = run_eval(model, val_overfit_same_loader, cfg, device, 'val_overfit_same', pscale)
+        val_reg = run_eval(model, val_regular_loader, cfg, device, 'val_regular', pscale)
+
+        obj_score = float(val_same.get('val_overfit_same/obj_trans_err_m', 1e9)) + 0.1 * float(val_same.get('val_overfit_same/obj_rot_err_rad', 1e9))
+        contact_score = float(val_same.get('val_overfit_same/contact_f1', -1e9))
+        balanced = obj_score + 0.05 * float(val_same.get('val_overfit_same/obj_arti_err', 1e9)) - 0.01 * contact_score
+
+        log = {'epoch': epoch + 1, 'lr': scheduler.get_last_lr()[0], 'object_score': obj_score, 'contact_score': contact_score, 'balanced_score': balanced, 'pred_rot_repr_type': 'axis_angle', 'gt_rot_repr_type': 'axis_angle'}
         log.update(train_log)
-        log.update(val_log)
+        log.update(val_same)
+        log.update(val_reg)
         append_jsonl(log, metric_path)
-        print(log)
 
-        val_key = float(val_log.get('obj_trans_err_m', 1e9)) + 0.05 * float(val_log.get('obj_rot_err_rad', 1e9))
-        save_ckpt(osp.join(out_dir, 'last.pt'), model, optimizer, scaler, epoch, best_metric, cfg)
-        if val_key < best_metric:
-            best_metric = val_key
-            save_ckpt(osp.join(out_dir, 'best.pt'), model, optimizer, scaler, epoch, best_metric, cfg)
-            print(f'[BEST] epoch={epoch+1} score={best_metric:.6f}')
+        scores = {'object_score': obj_score, 'contact_score': contact_score, 'balanced_score': balanced}
+        save_ckpt(osp.join(out_dir, 'last.pt'), model, optimizer, scaler, epoch, scores, cfg)
+        if obj_score < best['object']:
+            best['object'] = obj_score
+            save_ckpt(osp.join(out_dir, 'best_object.pt'), model, optimizer, scaler, epoch, scores, cfg)
+        if contact_score > best['contact']:
+            best['contact'] = contact_score
+            save_ckpt(osp.join(out_dir, 'best_contact.pt'), model, optimizer, scaler, epoch, scores, cfg)
+        if balanced < best['balanced']:
+            best['balanced'] = balanced
+            save_ckpt(osp.join(out_dir, 'best_balanced.pt'), model, optimizer, scaler, epoch, scores, cfg)
 
 
 if __name__ == '__main__':

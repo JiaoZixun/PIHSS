@@ -1,0 +1,41 @@
+processed_dir: ./outputs/picats_arctic/sequences
+train_list: ./outputs/picats_arctic/splits/train.txt
+val_list: ./outputs/picats_arctic/splits/val.txt
+out_dir: ./outputs/picats_arctic/stage3_teacher_vae_impl_rewrite/physics_warmup_static
+window: 16
+stride: 2
+batch_size: 2
+num_workers: 0
+epochs: 20
+lr: 0.0002
+min_lr: 1.0e-05
+weight_decay: 5.0e-05
+use_amp: false
+seed: 2026
+contact_thresh_m: 0.015
+dt: 0.0333333333
+stage: physics_warmup_static
+physics_scale_schedule:
+  type: linear
+  start: 0.0
+  end: 0.1
+  epochs: 20
+overfit:
+  enabled: false
+loss_weights:
+  obj_trans: 1.0
+  obj_rot: 0.5
+  obj_arti: 0.5
+  contact_bce: 0.5
+  contact_focal: 0.5
+  contact_dice: 0.5
+  endpoint_contact_dist: 1.0
+  no_contact_static: 0.1
+  contact_velocity: 0.0
+  contact_motion_align: 0.0
+  impulse_dyn: 0.0
+  angular_dyn: 0.0
+  friction_cone: 0.0
+  non_contact_force: 0.0
+  delta_smooth: 0.05
+  force_smooth: 0.0
