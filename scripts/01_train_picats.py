@@ -17,7 +17,7 @@ from pinn_hoi.data.arctic_io import ArcticPICATSWindowDataset
 from pinn_hoi.losses.picats_losses import compute_losses, compute_metrics
 from pinn_hoi.models.picats import build_model_from_config
 from pinn_hoi.common.finite_check import assert_finite_dict, assert_finite_tensor, check_model_grads_finite, check_model_params_finite
-from pinn_hoi.utils.io import append_jsonl, ensure_dir, load_config, mean_float_dict, save_json, seed_everything, to_device
+from pinn_hoi.utils.io import aggregate_eval_metrics, append_jsonl, ensure_dir, load_config, mean_float_dict, save_json, seed_everything, to_device
 
 
 def parse_args():
@@ -130,7 +130,7 @@ def run_eval(model, loader, cfg, device, split_tag: str, current_pscale: float, 
             metrics_all.append(compute_metrics(batch, out))
             losses_cur.append(lc)
             losses_full.append(lf)
-    md = {f'{split_tag}/{k}': v for k, v in mean_float_dict(metrics_all).items()}
+    md = {f'{split_tag}/{k}': v for k, v in aggregate_eval_metrics(metrics_all).items()}
     lcur = mean_float_dict(losses_cur)
     lfull = mean_float_dict(losses_full)
     out = {

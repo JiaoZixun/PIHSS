@@ -14,7 +14,7 @@ sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..', 'src')))
 from pinn_hoi.data.arctic_io import ArcticPICATSWindowDataset
 from pinn_hoi.losses.picats_losses import compute_losses, compute_metrics
 from pinn_hoi.models.picats import build_model_from_config
-from pinn_hoi.utils.io import ensure_dir, load_config, mean_float_dict, save_json, to_device
+from pinn_hoi.utils.io import aggregate_eval_metrics, ensure_dir, load_config, mean_float_dict, save_json, to_device
 
 
 def parse_args():
@@ -45,7 +45,7 @@ def main():
             _, losses = compute_losses(batch, out, cfg, physics_scale=1.0)
             metrics_all.append(compute_metrics(batch, out))
             losses_all.append(losses)
-    result = mean_float_dict(metrics_all)
+    result = aggregate_eval_metrics(metrics_all)
     result.update({f'loss/{k}': v for k, v in mean_float_dict(losses_all).items()})
     out_path = args.out or osp.join(cfg['out_dir'], f'eval_{args.split}.json')
     ensure_dir(osp.dirname(out_path))

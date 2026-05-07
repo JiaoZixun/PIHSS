@@ -206,16 +206,25 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
 
     prob = torch.sigmoid(out['contact_logits'])
     gt_contact = batch['contact_label'][:, :-1]
-    def prf_at(th: float):
+    def prf_counts_at(th: float):
         pred = (prob > th).float()
         tp = (pred * gt_contact).sum()
         fp = (pred * (1.0 - gt_contact)).sum()
         fn = ((1.0 - pred) * gt_contact).sum()
+        return tp, fp, fn
+
+    def prf_from_counts(tp: torch.Tensor, fp: torch.Tensor, fn: torch.Tensor):
         precision = tp / (tp + fp).clamp_min(1.0)
         recall = tp / (tp + fn).clamp_min(1.0)
-        f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-6)
+        f1 = torch.where(
+            (precision + recall) > 0,
+            2.0 * precision * recall / (precision + recall),
+            torch.zeros_like(precision),
+        )
         return precision, recall, f1
-    precision, recall, f1 = prf_at(0.5)
+
+    tp, fp, fn = prf_counts_at(0.5)
+    precision, recall, f1 = prf_from_counts(tp, fp, fn)
 
     no_contact = (gt_contact.flatten(2).mean(dim=-1) < 0.02)
     pred_drift = torch.linalg.norm(out['delta_pose7'][..., 4:7], dim=-1)
@@ -226,17 +235,18 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
         vel_loss, align_loss = contact_velocity_loss(batch, out)
         contact_motion_cos = 1.0 - align_loss
     else:
-        vel_loss = torch.tensor(float('nan'), device=gt_contact.device)
-        contact_motion_cos = torch.tensor(float('nan'), device=gt_contact.device)
+        vel_loss = torch.zeros((), device=gt_contact.device)
+        contact_motion_cos = torch.zeros((), device=gt_contact.device)
     prob_mean = prob.mean()
     prob_max = prob.max()
     pred_pos02 = (prob > 0.2).float().mean()
     pred_pos05 = (prob > 0.5).float().mean()
     pred_pos08 = (prob > 0.8).float().mean()
-    p005, r005, f005 = prf_at(0.05)
-    p01, r01, f01 = prf_at(0.1)
-    p02, r02, f02 = prf_at(0.2)
-    p05, r05, f05 = prf_at(0.5)
+    tp005, fp005, fn005 = prf_counts_at(0.05); p005, r005, f005 = prf_from_counts(tp005, fp005, fn005)
+    tp01, fp01, fn01 = prf_counts_at(0.1); p01, r01, f01 = prf_from_counts(tp01, fp01, fn01)
+    tp02, fp02, fn02 = prf_counts_at(0.2); p02, r02, f02 = prf_from_counts(tp02, fp02, fn02)
+    tp05, fp05, fn05 = prf_counts_at(0.5); p05, r05, f05 = prf_from_counts(tp05, fp05, fn05)
+    tp08, fp08, fn08 = prf_counts_at(0.8); p08, r08, f08 = prf_from_counts(tp08, fp08, fn08)
     rotvec_norm = torch.linalg.norm(pred_next[..., 1:4], dim=-1)
     return {
         'obj_trans_err_m': trans_err_m.mean(),
@@ -246,7 +256,7 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
         'obj_arti_err': arti_err.mean(),
         'contact_precision': precision,
         'contact_recall': recall,
-        'contact_f1': (f1 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f1.device)),
+        'contact_f1': f1,
         'no_contact_drift_m': no_contact_drift,
         'contact_velocity_residual_m': vel_loss,
         'contact_motion_cos': contact_motion_cos,
@@ -254,15 +264,25 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
         'gt_contact_ratio': gt_contact.mean(),
         'gt_contact_pos_count': gt_pos,
         'contact_valid_count': torch.tensor(float(gt_contact.numel()), device=gt_contact.device),
+        'contact_tp': tp,
+        'contact_fp': fp,
+        'contact_fn': fn,
+        'nan_window_count': torch.tensor(0.0, device=gt_contact.device),
         'pred_contact_prob_mean': prob_mean,
         'pred_contact_prob_max': prob_max,
         'pred_contact_pos_ratio@0.2': pred_pos02,
         'pred_contact_pos_ratio@0.5': pred_pos05,
         'pred_contact_pos_ratio@0.8': pred_pos08,
-        'contact_precision@0.05': p005, 'contact_recall@0.05': r005, 'contact_f1@0.05': (f005 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f005.device)),
-        'contact_precision@0.1': p01, 'contact_recall@0.1': r01, 'contact_f1@0.1': (f01 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f01.device)),
-        'contact_precision@0.2': p02, 'contact_recall@0.2': r02, 'contact_f1@0.2': (f02 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f02.device)),
-        'contact_precision@0.5': p05, 'contact_recall@0.5': r05, 'contact_f1@0.5': (f05 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f05.device)),
+        'contact_precision@0.05': p005, 'contact_recall@0.05': r005, 'contact_f1@0.05': f005,
+        'contact_precision@0.1': p01, 'contact_recall@0.1': r01, 'contact_f1@0.1': f01,
+        'contact_precision@0.2': p02, 'contact_recall@0.2': r02, 'contact_f1@0.2': f02,
+        'contact_precision@0.5': p05, 'contact_recall@0.5': r05, 'contact_f1@0.5': f05,
+        'contact_precision@0.8': p08, 'contact_recall@0.8': r08, 'contact_f1@0.8': f08,
+        'contact_tp@0.05': tp005, 'contact_fp@0.05': fp005, 'contact_fn@0.05': fn005,
+        'contact_tp@0.1': tp01, 'contact_fp@0.1': fp01, 'contact_fn@0.1': fn01,
+        'contact_tp@0.2': tp02, 'contact_fp@0.2': fp02, 'contact_fn@0.2': fn02,
+        'contact_tp@0.5': tp05, 'contact_fp@0.5': fp05, 'contact_fn@0.5': fn05,
+        'contact_tp@0.8': tp08, 'contact_fp@0.8': fp08, 'contact_fn@0.8': fn08,
         'rotvec_norm_mean': rotvec_norm.mean(),
         'rotvec_norm_std': rotvec_norm.std(unbiased=False),
         'rotvec_abs_max': pred_next[..., 1:4].abs().max(),
