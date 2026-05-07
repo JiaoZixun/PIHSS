@@ -5,7 +5,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn.functional as F
 
-from pinn_hoi.common.rot import gather_points, rotation_error_rad
+from pinn_hoi.common.rot import axis_angle_to_matrix, gather_points, rotation_error_rad
 
 
 def _safe_mean(x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -133,13 +133,19 @@ def compute_losses(
     pred_next = out['pred_next_pose7']
     losses: Dict[str, torch.Tensor] = {}
     losses['obj_trans'] = F.smooth_l1_loss(pred_next[..., 4:7], gt_next[..., 4:7], beta=0.02)
-    losses['obj_rot'] = rotation_error_rad(pred_next[..., 1:4], gt_next[..., 1:4]).mean()
+    Rp = axis_angle_to_matrix(pred_next[..., 1:4])
+    Rg = axis_angle_to_matrix(gt_next[..., 1:4])
+    losses['obj_rot'] = F.smooth_l1_loss(Rp, Rg, beta=0.01)
     losses['obj_arti'] = F.smooth_l1_loss(pred_next[..., 0:1], gt_next[..., 0:1], beta=0.02)
 
     contact_gt = batch['contact_label'][:, :-1]
     losses['contact_bce'] = F.binary_cross_entropy_with_logits(out['contact_logits'], contact_gt)
     losses['contact_focal'] = focal_bce_with_logits(out['contact_logits'], contact_gt)
-    losses['contact_dice'] = dice_loss(out['contact_prob'], contact_gt)
+    pos_count = contact_gt.sum()
+    if pos_count > 0:
+        losses['contact_dice'] = dice_loss(out['contact_prob'], contact_gt)
+    else:
+        losses['contact_dice'] = torch.zeros((), device=contact_gt.device, dtype=contact_gt.dtype)
     losses['endpoint_contact_dist'] = contact_distance_loss(batch, out, thresh)
 
     losses['no_contact_static'] = no_contact_static_loss(batch, out)
@@ -179,7 +185,8 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
     rot_err = rotation_error_rad(pred_next[..., 1:4], gt_next[..., 1:4])
     arti_err = torch.abs(pred_next[..., 0] - gt_next[..., 0])
 
-    pred_contact = (out['contact_prob'] > 0.5).float()
+    prob = torch.sigmoid(out['contact_logits'])
+    pred_contact = (prob > 0.5).float()
     gt_contact = batch['contact_label'][:, :-1]
     tp = (pred_contact * gt_contact).sum()
     fp = (pred_contact * (1.0 - gt_contact)).sum()
@@ -194,7 +201,13 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
 
     vel_loss, align_loss = contact_velocity_loss(batch, out)
     contact_motion_cos = 1.0 - align_loss
-    quat_norm = torch.linalg.norm(pred_next[..., 1:4], dim=-1)
+    gt_pos = gt_contact.sum()
+    prob_mean = prob.mean()
+    prob_max = prob.max()
+    pred_pos02 = (prob > 0.2).float().mean()
+    pred_pos05 = (prob > 0.5).float().mean()
+    pred_pos08 = (prob > 0.8).float().mean()
+    rotvec_norm = torch.linalg.norm(pred_next[..., 1:4], dim=-1)
     return {
         'obj_trans_err_m': trans_err_m.mean(),
         'obj_rot_err_rad': rot_err.mean(),
@@ -203,10 +216,19 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
         'obj_arti_err': arti_err.mean(),
         'contact_precision': precision,
         'contact_recall': recall,
-        'contact_f1': f1,
+        'contact_f1': (f1 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f1.device)),
         'no_contact_drift_m': no_contact_drift,
         'contact_velocity_residual_m': vel_loss,
         'contact_motion_cos': contact_motion_cos,
-        'quat_norm_mean': quat_norm.mean(),
-        'quat_norm_std': quat_norm.std(unbiased=False),
+        'gt_contact_ratio': gt_contact.mean(),
+        'gt_contact_pos_count': gt_pos,
+        'contact_valid_count': torch.tensor(float(gt_contact.numel()), device=gt_contact.device),
+        'pred_contact_prob_mean': prob_mean,
+        'pred_contact_prob_max': prob_max,
+        'pred_contact_pos_ratio@0.2': pred_pos02,
+        'pred_contact_pos_ratio@0.5': pred_pos05,
+        'pred_contact_pos_ratio@0.8': pred_pos08,
+        'rotvec_norm_mean': rotvec_norm.mean(),
+        'rotvec_norm_std': rotvec_norm.std(unbiased=False),
+        'rotvec_abs_max': pred_next[..., 1:4].abs().max(),
     }
