@@ -14,7 +14,7 @@ import sys
 sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..', 'src')))
 
 from pinn_hoi.data.arctic_io import ArcticPICATSWindowDataset
-from pinn_hoi.losses.picats_losses import compute_losses, compute_metrics
+from pinn_hoi.losses.picats_losses import build_contact_target, compute_losses, compute_metrics
 from pinn_hoi.models.picats import build_model_from_config
 from pinn_hoi.common.finite_check import assert_finite_dict, assert_finite_tensor, check_model_grads_finite, check_model_params_finite
 from pinn_hoi.utils.io import aggregate_eval_metrics, append_jsonl, ensure_dir, load_config, mean_float_dict, save_json, seed_everything, to_device
@@ -48,7 +48,7 @@ def build_dataset(cfg: Dict, split: str):
 def select_overfit_indices(ds, cfg: Dict, fallback_batches: int = 0):
     over = cfg.get('overfit', {})
     if not over.get('enabled', False) and fallback_batches <= 0:
-        return None
+        return None, None
     seed = int(over.get('fixed_indices_seed', cfg.get('seed', 2026)))
     g = torch.Generator().manual_seed(seed)
     n = int(over.get('num_windows', 0))
@@ -57,39 +57,50 @@ def select_overfit_indices(ds, cfg: Dict, fallback_batches: int = 0):
         n = int(cfg['batch_size']) * max(nb, 1)
     n = min(len(ds), n)
     candidates = list(range(len(ds)))
-    if over.get('require_positive_contact', False):
+    stats = []
+    for i in candidates:
+        sample = ds[i]
+        gt, valid = build_contact_target({'contact_label': sample['contact_label'].unsqueeze(0)})
+        valid_count = int(valid.sum().item())
+        pos_count = int((gt * valid).sum().item())
+        ratio = float(pos_count / max(valid_count, 1))
+        window_start = int(sample['window_start'].item())
+        window_end = int(sample['window_end'].item()) if 'window_end' in sample else window_start + int(cfg['window'])
+        stats.append({
+            'sample_idx': i,
+            'sequence_path': sample['seq_path'],
+            'window_start': window_start,
+            'window_end': window_end,
+            'contact_valid_count': valid_count,
+            'gt_contact_pos_count': pos_count,
+            'gt_contact_ratio': ratio,
+        })
+    if over.get('enabled', False):
+        min_valid = int(over.get('min_contact_valid_count', 1))
         min_pos = int(over.get('min_contact_pos_count', 20))
-        min_ratio = float(over.get('min_contact_ratio', 0.01))
-        stats = []
-        for i in candidates:
-            sample = ds[i]
-            gt = sample['contact_label'][:-1]
-            valid = torch.ones_like(gt)
-            valid_count = int(valid.sum().item())
-            pos_count = int((gt * valid).sum().item())
-            ratio = float(pos_count / max(valid_count, 1))
-            stats.append((i, sample['seq_path'], int(sample['window_start'].item()), valid_count, pos_count, ratio))
-        filtered = [s[0] for s in stats if s[4] >= min_pos and s[5] >= min_ratio]
+        min_ratio = float(over.get('min_contact_ratio', 0.03))
+        max_ratio = float(over.get('max_contact_ratio', 0.6))
+        filtered = [s for s in stats if s['contact_valid_count'] >= min_valid and s['gt_contact_pos_count'] >= min_pos and min_ratio <= s['gt_contact_ratio'] <= max_ratio]
         if len(filtered) == 0:
-            pos_counts = torch.tensor([s[4] for s in stats], dtype=torch.float32)
-            ratios = torch.tensor([s[5] for s in stats], dtype=torch.float32)
-            top = sorted(stats, key=lambda x: x[5], reverse=True)[:20]
-            top_lines = "\n".join([f'  {p}::st={st} ratio={r:.6f} pos={pc} valid={vc}' for _, p, st, vc, pc, r in top])
+            pos_counts = torch.tensor([s['gt_contact_pos_count'] for s in stats], dtype=torch.float32)
+            ratios = torch.tensor([s['gt_contact_ratio'] for s in stats], dtype=torch.float32)
+            top = sorted(stats, key=lambda x: x['gt_contact_ratio'], reverse=True)[:20]
+            top_lines = "\n".join([f"  {s['sequence_path']}::[{s['window_start']},{s['window_end']}) ratio={s['gt_contact_ratio']:.6f} pos={s['gt_contact_pos_count']} valid={s['contact_valid_count']}" for s in top])
             raise RuntimeError(
                 "No positive contact samples found for overfit subset.\n"
                 f"dataset_total_samples={len(ds)}\n"
                 f"gt_contact_pos_count_max={pos_counts.max().item():.1f}, mean={pos_counts.mean().item():.3f}\n"
                 f"gt_contact_ratio_max={ratios.max().item():.6f}, mean={ratios.mean().item():.6f}\n"
                 f"top20_contact_ratio_samples=\n{top_lines}\n"
-                f"contact_thresh_m={cfg.get('contact_thresh_m')} contact_mode=contact_label valid_mask=all_ones"
+                f"filters: min_valid={min_valid}, min_pos={min_pos}, min_ratio={min_ratio}, max_ratio={max_ratio}"
             )
-        candidates = filtered
+        candidates = [s['sample_idx'] for s in filtered]
     if bool(over.get('shuffle', False)):
         perm = torch.randperm(len(candidates), generator=g)[:n].tolist()
         idx = [candidates[j] for j in perm]
     else:
         idx = candidates[:n]
-    return idx
+    return idx, {'all_windows': stats, 'selected_windows': [stats[i] for i in idx]}
 
 
 def make_loader_from_dataset(ds, cfg: Dict, split: str, subset_indices=None, shuffle=None):
@@ -158,11 +169,25 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     train_ds, val_ds = build_dataset(cfg, 'train'), build_dataset(cfg, 'val')
-    overfit_idx = select_overfit_indices(train_ds, cfg, args.overfit_batches)
+    overfit_idx, overfit_stats = select_overfit_indices(train_ds, cfg, args.overfit_batches)
     overfit_same = bool(cfg.get('overfit', {}).get('same_val', False))
     train_loader = make_loader_from_dataset(train_ds, cfg, 'train', overfit_idx, shuffle=bool(cfg.get('overfit', {}).get('shuffle', False) if overfit_idx is not None else True))
     val_overfit_same_loader = make_loader_from_dataset(val_ds if not overfit_same else train_ds, cfg, 'val', overfit_idx if overfit_same else None, shuffle=False)
     val_regular_loader = make_loader_from_dataset(val_ds, cfg, 'val', None, shuffle=False)
+    if overfit_idx is not None:
+        selected = overfit_stats['selected_windows']
+        ratios = torch.tensor([s['gt_contact_ratio'] for s in selected], dtype=torch.float32)
+        summary = {
+            'overfit_num_windows': len(selected),
+            'gt_contact_ratio_mean': float(ratios.mean().item()) if len(selected) else 0.0,
+            'gt_contact_ratio_min': float(ratios.min().item()) if len(selected) else 0.0,
+            'gt_contact_ratio_max': float(ratios.max().item()) if len(selected) else 0.0,
+            'total_positive_contact_count': int(sum(s['gt_contact_pos_count'] for s in selected)),
+            'total_valid_contact_count': int(sum(s['contact_valid_count'] for s in selected)),
+            'selected_windows': selected,
+        }
+        print(f'[overfit subset summary] {summary}')
+        save_json(summary, osp.join(out_dir, 'overfit_subset_stats.json'))
 
     model = build_model_from_config(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg['lr']), weight_decay=float(cfg.get('weight_decay', 0.0)))
