@@ -1,7 +1,7 @@
 processed_dir: ./outputs/picats_arctic/sequences
 train_list: ./outputs/picats_arctic/splits/train.txt
 val_list: ./outputs/picats_arctic/splits/val.txt
-out_dir: ./outputs/picats_arctic/stage3_teacher_vae_impl_rewrite/supervised_overfit
+out_dir: ./outputs/picats_arctic/supervised_overfit
 window: 16
 stride: 2
 batch_size: 2
