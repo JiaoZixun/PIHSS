@@ -39,6 +39,11 @@ overfit:
   same_val: true
   fixed_indices_seed: 2026
   shuffle: false
+  require_positive_contact: true
+  min_contact_pos_count: 20
+  min_contact_ratio: 0.01
+debug:
+  contact_only_overfit: false
 early_stop:
   metric: val_overfit_same/balanced_score
   mode: min
