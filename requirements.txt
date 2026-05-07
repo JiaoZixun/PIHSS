@@ -1,0 +1,9 @@
+torch>=1.13
+numpy
+scipy
+tqdm
+trimesh
+imageio
+matplotlib
+smplx
+pyyaml
