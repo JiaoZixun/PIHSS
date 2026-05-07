@@ -139,13 +139,24 @@ def compute_losses(
     losses['obj_arti'] = F.smooth_l1_loss(pred_next[..., 0:1], gt_next[..., 0:1], beta=0.02)
 
     contact_gt = batch['contact_label'][:, :-1]
-    losses['contact_bce'] = F.binary_cross_entropy_with_logits(out['contact_logits'], contact_gt)
-    losses['contact_focal'] = focal_bce_with_logits(out['contact_logits'], contact_gt)
     pos_count = contact_gt.sum()
+    neg_count = contact_gt.numel() - pos_count
+    pos_weight = (neg_count / pos_count.clamp_min(1.0)).clamp(1.0, 20.0)
+    losses['contact_bce'] = F.binary_cross_entropy_with_logits(out['contact_logits'], contact_gt, pos_weight=pos_weight)
+    losses['contact_focal'] = focal_bce_with_logits(out['contact_logits'], contact_gt)
     if pos_count > 0:
         losses['contact_dice'] = dice_loss(out['contact_prob'], contact_gt)
     else:
         losses['contact_dice'] = torch.zeros((), device=contact_gt.device, dtype=contact_gt.dtype)
+    losses['contact_bce_pos_weight'] = pos_weight
+    losses['contact_loss_pos_count'] = pos_count
+    losses['contact_loss_neg_count'] = torch.tensor(float(neg_count), device=contact_gt.device)
+    losses['contact_logits_mean'] = out['contact_logits'].mean()
+    losses['contact_logits_max'] = out['contact_logits'].max()
+    losses['contact_logits_min'] = out['contact_logits'].min()
+    losses['contact_prob_mean'] = out['contact_prob'].mean()
+    losses['contact_prob_max'] = out['contact_prob'].max()
+    losses['contact_prob_min'] = out['contact_prob'].min()
     losses['endpoint_contact_dist'] = contact_distance_loss(batch, out, thresh)
 
     losses['no_contact_static'] = no_contact_static_loss(batch, out)
@@ -166,7 +177,15 @@ def compute_losses(
             supervised_total = supervised_total + w * v
         if k in physics_keys:
             physics_total = physics_total + w * v
-    total = supervised_total + float(physics_scale) * physics_total
+    debug_contact_only = bool(cfg.get('debug', {}).get('contact_only_overfit', False))
+    if debug_contact_only:
+        total = (
+            float(weights.get('contact_bce', 0.0)) * losses['contact_bce']
+            + float(weights.get('contact_focal', 0.0)) * losses['contact_focal']
+            + float(weights.get('contact_dice', 0.0)) * losses['contact_dice']
+        )
+    else:
+        total = supervised_total + float(physics_scale) * physics_total
     total_full = supervised_total + float(full_physics_scale) * physics_total
     losses['supervised_total'] = supervised_total
     losses['physics_total'] = physics_total
@@ -186,27 +205,38 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
     arti_err = torch.abs(pred_next[..., 0] - gt_next[..., 0])
 
     prob = torch.sigmoid(out['contact_logits'])
-    pred_contact = (prob > 0.5).float()
     gt_contact = batch['contact_label'][:, :-1]
-    tp = (pred_contact * gt_contact).sum()
-    fp = (pred_contact * (1.0 - gt_contact)).sum()
-    fn = ((1.0 - pred_contact) * gt_contact).sum()
-    precision = tp / (tp + fp).clamp_min(1.0)
-    recall = tp / (tp + fn).clamp_min(1.0)
-    f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-6)
+    def prf_at(th: float):
+        pred = (prob > th).float()
+        tp = (pred * gt_contact).sum()
+        fp = (pred * (1.0 - gt_contact)).sum()
+        fn = ((1.0 - pred) * gt_contact).sum()
+        precision = tp / (tp + fp).clamp_min(1.0)
+        recall = tp / (tp + fn).clamp_min(1.0)
+        f1 = 2.0 * precision * recall / (precision + recall).clamp_min(1e-6)
+        return precision, recall, f1
+    precision, recall, f1 = prf_at(0.5)
 
     no_contact = (gt_contact.flatten(2).mean(dim=-1) < 0.02)
     pred_drift = torch.linalg.norm(out['delta_pose7'][..., 4:7], dim=-1)
     no_contact_drift = pred_drift[no_contact].mean() if no_contact.any() else torch.zeros((), device=pred_drift.device)
 
-    vel_loss, align_loss = contact_velocity_loss(batch, out)
-    contact_motion_cos = 1.0 - align_loss
     gt_pos = gt_contact.sum()
+    if gt_pos.item() > 0:
+        vel_loss, align_loss = contact_velocity_loss(batch, out)
+        contact_motion_cos = 1.0 - align_loss
+    else:
+        vel_loss = torch.tensor(float('nan'), device=gt_contact.device)
+        contact_motion_cos = torch.tensor(float('nan'), device=gt_contact.device)
     prob_mean = prob.mean()
     prob_max = prob.max()
     pred_pos02 = (prob > 0.2).float().mean()
     pred_pos05 = (prob > 0.5).float().mean()
     pred_pos08 = (prob > 0.8).float().mean()
+    p005, r005, f005 = prf_at(0.05)
+    p01, r01, f01 = prf_at(0.1)
+    p02, r02, f02 = prf_at(0.2)
+    p05, r05, f05 = prf_at(0.5)
     rotvec_norm = torch.linalg.norm(pred_next[..., 1:4], dim=-1)
     return {
         'obj_trans_err_m': trans_err_m.mean(),
@@ -220,6 +250,7 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
         'no_contact_drift_m': no_contact_drift,
         'contact_velocity_residual_m': vel_loss,
         'contact_motion_cos': contact_motion_cos,
+        'valid_contact_pair_count': gt_pos,
         'gt_contact_ratio': gt_contact.mean(),
         'gt_contact_pos_count': gt_pos,
         'contact_valid_count': torch.tensor(float(gt_contact.numel()), device=gt_contact.device),
@@ -228,6 +259,10 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
         'pred_contact_pos_ratio@0.2': pred_pos02,
         'pred_contact_pos_ratio@0.5': pred_pos05,
         'pred_contact_pos_ratio@0.8': pred_pos08,
+        'contact_precision@0.05': p005, 'contact_recall@0.05': r005, 'contact_f1@0.05': (f005 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f005.device)),
+        'contact_precision@0.1': p01, 'contact_recall@0.1': r01, 'contact_f1@0.1': (f01 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f01.device)),
+        'contact_precision@0.2': p02, 'contact_recall@0.2': r02, 'contact_f1@0.2': (f02 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f02.device)),
+        'contact_precision@0.5': p05, 'contact_recall@0.5': r05, 'contact_f1@0.5': (f05 if gt_pos.item() > 0 else torch.tensor(float('nan'), device=f05.device)),
         'rotvec_norm_mean': rotvec_norm.mean(),
         'rotvec_norm_std': rotvec_norm.std(unbiased=False),
         'rotvec_abs_max': pred_next[..., 1:4].abs().max(),
