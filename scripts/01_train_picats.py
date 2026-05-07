@@ -16,6 +16,7 @@ sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..', 'src')))
 from pinn_hoi.data.arctic_io import ArcticPICATSWindowDataset
 from pinn_hoi.losses.picats_losses import compute_losses, compute_metrics
 from pinn_hoi.models.picats import build_model_from_config
+from pinn_hoi.common.finite_check import assert_finite_dict, assert_finite_tensor, check_model_grads_finite, check_model_params_finite
 from pinn_hoi.utils.io import append_jsonl, ensure_dir, load_config, mean_float_dict, save_json, seed_everything, to_device
 
 
@@ -85,13 +86,16 @@ def load_ckpt(path: str, model, optimizer=None, scaler=None):
     return int(ckpt.get('epoch', -1)) + 1
 
 
-def run_eval(model, loader, cfg, device, split_tag: str, current_pscale: float):
+def run_eval(model, loader, cfg, device, split_tag: str, current_pscale: float, dump_dir: str):
     model.eval()
     metrics_all, losses_cur, losses_full = [], [], []
     with torch.no_grad():
-        for batch in tqdm(loader, desc=f'eval {split_tag}', leave=False):
+        for bi, batch in enumerate(tqdm(loader, desc=f'eval {split_tag}', leave=False)):
             batch = to_device(batch, device)
+            dctx = {'epoch': -1, 'batch_idx': bi, 'split': split_tag, 'dump_dir': dump_dir}
+            assert_finite_dict('batch', batch, dctx)
             out = model(batch)
+            assert_finite_dict('model_out', out, dctx)
             _, lc = compute_losses(batch, out, cfg, physics_scale=current_pscale, full_physics_scale=1.0)
             _, lf = compute_losses(batch, out, cfg, physics_scale=1.0, full_physics_scale=1.0)
             metrics_all.append(compute_metrics(batch, out))
@@ -146,43 +150,54 @@ def main():
         pscale = physics_scale_for_epoch(epoch, cfg)
         train_losses = []
         pbar = tqdm(train_loader, desc=f'train {epoch+1}/{cfg["epochs"]} p={pscale:.3f}')
-        for batch in pbar:
+        for bi, batch in enumerate(pbar):
             batch = to_device(batch, device)
+            dctx = {'epoch': epoch + 1, 'batch_idx': bi, 'split': 'train', 'dump_dir': osp.join(out_dir, 'debug_nan')}
+            assert_finite_dict('batch', batch, dctx)
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=use_amp):
                 out = model(batch)
+                assert_finite_dict('model_out', out, dctx)
                 total, losses = compute_losses(batch, out, cfg, physics_scale=pscale, full_physics_scale=1.0)
+                assert_finite_dict('loss', losses, dctx)
+                assert_finite_tensor('loss.total', total, dctx)
             scaler.scale(total).backward()
+            grad_norm = check_model_grads_finite(model, dctx)
             scaler.step(optimizer)
             scaler.update()
+            check_model_params_finite(model, dctx)
             scheduler.step()
+            losses['grad_norm'] = torch.tensor(grad_norm, device=total.device)
             train_losses.append(losses)
 
         train_log = {f'train_overfit/{k}': v for k, v in mean_float_dict(train_losses).items()}
         train_log['train_loss/total_current_scale'] = train_log['train_overfit/total_current_scale']
         train_log['train_loss/physics_scale'] = train_log['train_overfit/physics_scale']
-        val_same = run_eval(model, val_overfit_same_loader, cfg, device, 'val_overfit_same', pscale)
-        val_reg = run_eval(model, val_regular_loader, cfg, device, 'val_regular', pscale)
+        val_same = run_eval(model, val_overfit_same_loader, cfg, device, 'val_overfit_same', pscale, osp.join(out_dir, 'debug_nan'))
+        val_reg = run_eval(model, val_regular_loader, cfg, device, 'val_regular', pscale, osp.join(out_dir, 'debug_nan'))
 
-        obj_score = float(val_same.get('val_overfit_same/obj_trans_err_m', 1e9)) + 0.1 * float(val_same.get('val_overfit_same/obj_rot_err_rad', 1e9))
-        contact_score = float(val_same.get('val_overfit_same/contact_f1', -1e9))
-        balanced = obj_score + 0.05 * float(val_same.get('val_overfit_same/obj_arti_err', 1e9)) - 0.01 * contact_score
+        obj_score = float(val_same.get('val_overfit_same/obj_trans_err_m', 1e9)) + 0.1 * float(val_same.get('val_overfit_same/obj_rot_err_rad', 1e9)) + 0.05 * float(val_same.get('val_overfit_same/obj_arti_err', 1e9))
+        contact_score = float(val_same.get('val_overfit_same/contact_f1', float('nan')))
+        balanced = obj_score
 
         log = {'epoch': epoch + 1, 'lr': scheduler.get_last_lr()[0], 'object_score': obj_score, 'contact_score': contact_score, 'balanced_score': balanced, 'pred_rot_repr_type': 'axis_angle', 'gt_rot_repr_type': 'axis_angle'}
         log.update(train_log)
         log.update(val_same)
         log.update(val_reg)
+        if not (torch.isfinite(torch.tensor(obj_score)) and torch.isfinite(torch.tensor(balanced))):
+            raise FloatingPointError(f'Non-finite score at epoch {epoch+1}: {obj_score}, {balanced}')
         append_jsonl(log, metric_path)
 
         scores = {'object_score': obj_score, 'contact_score': contact_score, 'balanced_score': balanced}
         save_ckpt(osp.join(out_dir, 'last.pt'), model, optimizer, scaler, epoch, scores, cfg)
-        if obj_score < best['object']:
+        save_ckpt(osp.join(out_dir, 'last_finite.pt'), model, optimizer, scaler, epoch, scores, cfg)
+        if torch.isfinite(torch.tensor(obj_score)) and obj_score < best['object']:
             best['object'] = obj_score
             save_ckpt(osp.join(out_dir, 'best_object.pt'), model, optimizer, scaler, epoch, scores, cfg)
-        if contact_score > best['contact']:
+        if torch.isfinite(torch.tensor(contact_score)) and contact_score > best['contact']:
             best['contact'] = contact_score
             save_ckpt(osp.join(out_dir, 'best_contact.pt'), model, optimizer, scaler, epoch, scores, cfg)
-        if balanced < best['balanced']:
+        if torch.isfinite(torch.tensor(balanced)) and balanced < best['balanced']:
             best['balanced'] = balanced
             save_ckpt(osp.join(out_dir, 'best_balanced.pt'), model, optimizer, scaler, epoch, scores, cfg)
 

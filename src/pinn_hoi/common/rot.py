@@ -75,5 +75,5 @@ def rotation_error_rad(pred_aa: torch.Tensor, gt_aa: torch.Tensor) -> torch.Tens
     Rp = axis_angle_to_matrix(pred_aa)
     Rg = axis_angle_to_matrix(gt_aa)
     R = Rp.transpose(-1, -2) @ Rg
-    cos = ((R.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5).clamp(-1.0, 1.0)
+    cos = ((R.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) * 0.5).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
     return torch.acos(cos)
