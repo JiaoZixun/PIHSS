@@ -56,10 +56,39 @@ def select_overfit_indices(ds, cfg: Dict, fallback_batches: int = 0):
         nb = int(over.get('num_batches', fallback_batches))
         n = int(cfg['batch_size']) * max(nb, 1)
     n = min(len(ds), n)
+    candidates = list(range(len(ds)))
+    if over.get('require_positive_contact', False):
+        min_pos = int(over.get('min_contact_pos_count', 20))
+        min_ratio = float(over.get('min_contact_ratio', 0.01))
+        stats = []
+        for i in candidates:
+            sample = ds[i]
+            gt = sample['contact_label'][:-1]
+            valid = torch.ones_like(gt)
+            valid_count = int(valid.sum().item())
+            pos_count = int((gt * valid).sum().item())
+            ratio = float(pos_count / max(valid_count, 1))
+            stats.append((i, sample['seq_path'], int(sample['window_start'].item()), valid_count, pos_count, ratio))
+        filtered = [s[0] for s in stats if s[4] >= min_pos and s[5] >= min_ratio]
+        if len(filtered) == 0:
+            pos_counts = torch.tensor([s[4] for s in stats], dtype=torch.float32)
+            ratios = torch.tensor([s[5] for s in stats], dtype=torch.float32)
+            top = sorted(stats, key=lambda x: x[5], reverse=True)[:20]
+            top_lines = "\n".join([f'  {p}::st={st} ratio={r:.6f} pos={pc} valid={vc}' for _, p, st, vc, pc, r in top])
+            raise RuntimeError(
+                "No positive contact samples found for overfit subset.\n"
+                f"dataset_total_samples={len(ds)}\n"
+                f"gt_contact_pos_count_max={pos_counts.max().item():.1f}, mean={pos_counts.mean().item():.3f}\n"
+                f"gt_contact_ratio_max={ratios.max().item():.6f}, mean={ratios.mean().item():.6f}\n"
+                f"top20_contact_ratio_samples=\n{top_lines}\n"
+                f"contact_thresh_m={cfg.get('contact_thresh_m')} contact_mode=contact_label valid_mask=all_ones"
+            )
+        candidates = filtered
     if bool(over.get('shuffle', False)):
-        idx = torch.randperm(len(ds), generator=g)[:n].tolist()
+        perm = torch.randperm(len(candidates), generator=g)[:n].tolist()
+        idx = [candidates[j] for j in perm]
     else:
-        idx = list(range(n))
+        idx = candidates[:n]
     return idx
 
 
@@ -161,6 +190,7 @@ def main():
                 total, losses = compute_losses(batch, out, cfg, physics_scale=pscale, full_physics_scale=1.0)
                 assert_finite_dict('loss', losses, dctx)
                 assert_finite_tensor('loss.total', total, dctx)
+                metrics = compute_metrics(batch, out)
             scaler.scale(total).backward()
             grad_norm = check_model_grads_finite(model, dctx)
             scaler.step(optimizer)
@@ -168,6 +198,9 @@ def main():
             check_model_params_finite(model, dctx)
             scheduler.step()
             losses['grad_norm'] = torch.tensor(grad_norm, device=total.device)
+            for k, v in metrics.items():
+                if k.startswith('gt_contact_') or k.startswith('contact_valid_count') or k.startswith('pred_contact_prob') or k.startswith('pred_contact_pos_ratio@'):
+                    losses[k] = v
             train_losses.append(losses)
 
         train_log = {f'train_overfit/{k}': v for k, v in mean_float_dict(train_losses).items()}
