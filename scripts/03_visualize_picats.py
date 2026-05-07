@@ -13,7 +13,11 @@ sys.path.insert(0, osp.abspath(osp.join(osp.dirname(__file__), '..', 'src')))
 from pinn_hoi.models.picats import build_model_from_config
 from pinn_hoi.utils.io import load_config, npz_to_dict, to_device
 from pinn_hoi.utils.vis import render_hand_object_prediction_video
+import os
+os.environ.setdefault("MPLBACKEND", "Agg")
 
+import matplotlib
+matplotlib.use("Agg", force=True)
 
 def parse_args():
     p = argparse.ArgumentParser()

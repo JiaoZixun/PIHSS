@@ -79,7 +79,26 @@ def render_hand_object_prediction_video(
         ax.view_init(elev=20, azim=-65)
         fig.canvas.draw()
         w, h = fig.canvas.get_width_height()
-        img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3)
+        img = figure_to_rgb_array(fig)
         frames.append(img)
         plt.close(fig)
     imageio.mimsave(out_path, frames, fps=fps)
+
+
+def figure_to_rgb_array(fig):
+    fig.canvas.draw()
+
+    if hasattr(fig.canvas, "buffer_rgba"):
+        rgba = np.asarray(fig.canvas.buffer_rgba())
+        return rgba[..., :3].copy()
+
+    if hasattr(fig.canvas, "tostring_rgb"):
+        w, h = fig.canvas.get_width_height()
+        return np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8).reshape(h, w, 3).copy()
+
+    if hasattr(fig.canvas, "print_to_buffer"):
+        buf, (w, h) = fig.canvas.print_to_buffer()
+        rgba = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 4)
+        return rgba[..., :3].copy()
+
+    raise RuntimeError(f"Unsupported matplotlib canvas type: {type(fig.canvas)}")
