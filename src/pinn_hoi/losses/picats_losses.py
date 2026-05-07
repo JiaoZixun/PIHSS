@@ -8,6 +8,13 @@ import torch.nn.functional as F
 from pinn_hoi.common.rot import axis_angle_to_matrix, gather_points, rotation_error_rad
 
 
+def build_contact_target(batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unified contact target builder for train/eval/overfit selection."""
+    gt_contact = batch['contact_label'][:, :-1]
+    valid_mask = torch.ones_like(gt_contact)
+    return gt_contact, valid_mask
+
+
 def _safe_mean(x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
     if mask is None:
         return x.mean() if x.numel() > 0 else torch.zeros((), device=x.device, dtype=x.dtype)
@@ -40,7 +47,7 @@ def contact_distance_loss(batch: Dict[str, torch.Tensor], out: Dict[str, torch.T
 
 
 def no_contact_static_loss(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]) -> torch.Tensor:
-    gt_contact = batch['contact_label'][:, :-1]
+    gt_contact, _ = build_contact_target(batch)
     contact_amount = gt_contact.flatten(2).mean(dim=-1)  # [B,T-1]
     no_contact = (contact_amount < 0.02).float()
     pred_delta_trans = torch.linalg.norm(out['delta_pose7'][..., 4:7], dim=-1)
@@ -53,7 +60,7 @@ def contact_velocity_loss(batch: Dict[str, torch.Tensor], out: Dict[str, torch.T
     hand = batch['hand_endpoints']             # [B,T,2,21,3]
     obj = batch['obj_points_world']            # [B,T,N,3]
     idx = batch['endpoint_nearest_obj_idx']     # [B,T,2,21]
-    contact = batch['contact_label'][:, :-1]
+    contact, _ = build_contact_target(batch)
 
     hand_v = hand[:, 1:] - hand[:, :-1]
     near_cur = gather_points(obj[:, :-1], idx[:, :-1])
@@ -102,7 +109,7 @@ def impulse_dynamics_losses(batch: Dict[str, torch.Tensor], out: Dict[str, torch
     friction = F.relu(-fn).mean() + F.relu(torch.linalg.norm(ft, dim=-1) - mu * F.relu(fn)).mean()
 
     # Non-contact endpoints should not emit large force.
-    non_contact = 1.0 - batch['contact_label'][:, :-1]
+    non_contact = 1.0 - build_contact_target(batch)[0]
     non_contact_force = _safe_mean(torch.linalg.norm(impulse, dim=-1), non_contact)
     return dyn_trans, dyn_ang, friction, non_contact_force
 
@@ -138,7 +145,7 @@ def compute_losses(
     losses['obj_rot'] = F.smooth_l1_loss(Rp, Rg, beta=0.01)
     losses['obj_arti'] = F.smooth_l1_loss(pred_next[..., 0:1], gt_next[..., 0:1], beta=0.02)
 
-    contact_gt = batch['contact_label'][:, :-1]
+    contact_gt, _ = build_contact_target(batch)
     pos_count = contact_gt.sum()
     neg_count = contact_gt.numel() - pos_count
     pos_weight = (neg_count / pos_count.clamp_min(1.0)).clamp(1.0, 20.0)
@@ -205,7 +212,7 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
     arti_err = torch.abs(pred_next[..., 0] - gt_next[..., 0])
 
     prob = torch.sigmoid(out['contact_logits'])
-    gt_contact = batch['contact_label'][:, :-1]
+    gt_contact, valid_mask = build_contact_target(batch)
     def prf_counts_at(th: float):
         pred = (prob > th).float()
         tp = (pred * gt_contact).sum()
@@ -239,6 +246,7 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
         contact_motion_cos = torch.zeros((), device=gt_contact.device)
     prob_mean = prob.mean()
     prob_max = prob.max()
+    prob_min = prob.min()
     pred_pos02 = (prob > 0.2).float().mean()
     pred_pos05 = (prob > 0.5).float().mean()
     pred_pos08 = (prob > 0.8).float().mean()
@@ -263,13 +271,14 @@ def compute_metrics(batch: Dict[str, torch.Tensor], out: Dict[str, torch.Tensor]
         'valid_contact_pair_count': gt_pos,
         'gt_contact_ratio': gt_contact.mean(),
         'gt_contact_pos_count': gt_pos,
-        'contact_valid_count': torch.tensor(float(gt_contact.numel()), device=gt_contact.device),
+        'contact_valid_count': valid_mask.sum(),
         'contact_tp': tp,
         'contact_fp': fp,
         'contact_fn': fn,
         'nan_window_count': torch.tensor(0.0, device=gt_contact.device),
         'pred_contact_prob_mean': prob_mean,
         'pred_contact_prob_max': prob_max,
+        'pred_contact_prob_min': prob_min,
         'pred_contact_pos_ratio@0.2': pred_pos02,
         'pred_contact_pos_ratio@0.5': pred_pos05,
         'pred_contact_pos_ratio@0.8': pred_pos08,
